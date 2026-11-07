@@ -1,102 +1,82 @@
-# Research Log Update — 7 November 2026
+# Research Log Update — November 7, 2026
 
-**Project:** Investigating the Reliability of GitHub Traces for Coding-Agent Detection  
-**Status:** Pipeline-output analysis and source-code inspection completed; manual evidence audit remains in progress.
+This note records the source-code review and evidence-audit preparation completed after the initial pipeline run. The original `agent-impact` implementation was inspected but not modified.
 
-## Research-question structure
+## Source-code review
 
-The research questions are now standardized across the README and research log:
+I traced how the upstream pipeline produces its file-based, ignored-file, and commit-based signals.
 
-- **RQ1 — Signal disagreement:** How often do file-based and commit-based detection signals disagree in this selected repository sample?
-- **RQ2 — Evidence quality:** What public evidence supports selected classifications, and where does that evidence remain ambiguous?
-- **RQ3 — Missed traces:** Are there repositories with credible public evidence of coding-agent use for which the pipeline does not identify the corresponding trace?
-- **RQ4 — Trace resilience:** How do detection outcomes change when selected trace markers are removed or altered in controlled repository copies or test fixtures?
+### File-based and ignored-file signals
 
-RQ1 has a preliminary descriptive result. RQ2–RQ4 remain open.
+The file-based detector loads patterns from `config/patterns/files.csv`, compiles them as regular expressions, and matches them against repository paths. The `tool_use` flag is set when file analysis returns tool matches.
 
-## Source-code inspection
-
-The upstream implementation was inspected locally without modifying its detection logic.
-
-### File and ignored-file signals
-
-- `code/repo_analyzer.py` calls file analysis and sets `tool_use=True` when the resulting `tool_results` collection is nonempty.
-- The same analyzer separately scans `.gitignore` and sets `ignored_tools=True` when configured patterns match ignored entries.
-- File patterns come from `config/patterns/files.csv` and are compiled as regular expressions by `code/heuristics.py`.
-
-A `.gitignore` match is therefore a separate trace. It does not establish that the matched directory or file exists in the repository tree.
+The analyzer separately reads `.gitignore` entries. A matching ignored path sets `ignored_tools`, but this does not establish that the ignored path exists in the repository tree.
 
 ### Direct commit attribution
 
-`code/heuristics.py` checks the commit's author and extracts co-authors from commit messages with this format:
+The commit classifier checks the main commit author and extracts co-author identities from `Co-authored-by: Name <email>` entries in commit messages. These identities are matched against `config/patterns/authors.csv`.
 
-`Co-authored-by: Name <email>`
+A product name appearing in ordinary commit-message prose is not equivalent to a matching author or co-author identity.
 
-The resulting author identity is matched against `config/patterns/authors.csv`. A general product reference in a commit-message body is not, by itself, the same as a matching author or co-author attribution.
+### Pull-request-derived attribution
 
-### PR-derived attribution
+The tagger can perform a second pass when pull-request branch names or labels match configured AI patterns. A specific Codex task URL marker in a PR body can also trigger the second pass. The body marker does not identify the tool by itself; the tagger then relies on the PR's existing author classifications.
 
-The commit tagger has a second route. When no direct AI-authored commit is found in a PR, matching PR branch names or labels (and a specific PR-body marker) can cause the first PR commit to receive an AI label; later commits can receive follow-up labels.
+When branch or label metadata provides a tool classification, the tagger can assign an AI classification to the first PR commit and follow-up classifications to later commits by the same PR author.
 
-`code/pr_merge_types.py` maps PR commit SHAs to main-branch commit SHAs:
-- merge and fast-forward cases can use identity mappings;
-- squash mapping sends PR commit SHAs to the squash commit SHA;
-- rebase mapping compares commit messages and author email addresses;
-- partial rebase can map only some PR commits.
+### Merge mapping and ratios
 
-`code/compute_metrics.py` applies PR tags to mapped main-branch commits. The mapping's `confidence` is retained in the classified-PR object, but the inspected tagging application does not use that value as a filter.
+The pipeline classifies PR merge strategies and maps PR commit SHAs to main-branch commit SHAs. The inspected code covers merge, squash, rebase, partial-rebase, and fast-forward cases.
 
-This inspection establishes that the pipeline's `commit_use` is a derived signal that may include PR-inferred commit labels. It is not independent proof of coding-agent use.
+`AI-FOLLOWUP` classifications are simplified to `AI` before ratio calculation. The overall commit ratio counts AI-classified commits divided by AI- plus Human-classified commits; Bot commits are excluded. The upstream file filter is applied before this calculation. At report level, `commit_use` is set when the overall commit ratio is positive.
 
-### Ratio calculation
+This means that `commit_use=true` can result from PR-derived attribution as well as direct author or co-author matching. The pipeline's own classification is therefore not independent evidence that an agent was used.
 
-Before calculating ratios, the upstream code simplifies `AI-FOLLOWUP` to `AI`. The overall commit ratio counts commits classified as AI divided by the sum of commits classified as AI and Human. Bot commits are excluded. The main analysis also applies the upstream file filter before ratio calculation. The ratio does not measure AI-generated lines.
+## Source-code observations requiring tests
 
-At report level, `commit_use` is set when the overall commit ratio is positive. A missing ratio should not be converted to zero automatically.
+Three implementation details were noted. Their effects on the 56 successful repository reports have not been measured.
 
-## Implementation observations for later verification
+1. In `CommitTagger.maybe_filter_commits_after_first_author()`, the code compares a tag value with the string `AI-PR-authored`, while the inspected tag assignments use `TypeTool` tuples such as `("AI", "Claude Code")`. This appears to be a type mismatch. The practical effect has not been tested.
+2. File patterns are compiled as regular expressions; shell-style wildcard conversion is not performed. The pattern `.copilot-*.md` therefore does not behave like a conventional filename glob.
+3. PR merge classification records a confidence value, but the inspected commit-classification function applies available SHA mappings without using confidence as a threshold.
 
-Two source-level details need to be retained in the limitations and tested before making claims about their effect:
+These remain source-code observations. The upstream detector was not modified, and no conclusion has been drawn about the impact of these details on detection accuracy.
 
-1. `CommitTagger.maybe_filter_commits_after_first_author()` tests whether `tags.get(c.sha) == 'AI-PR-authored'`. However, the declared `TypeTool` is a tuple of `(AuthorType, tool_name)`, and the inspected tagger returns tuple values. The comparison appears inconsistent and may leave the intended first-AI-commit trimming branch inactive.
-2. The file pattern loader compiles configured patterns as regular expressions; it does not convert shell-style wildcards to regular expressions. Therefore, `.copilot-*.md` should not be assumed to behave like a conventional filename glob.
+## Evidence-audit preparation
 
-These are source-code observations. No controlled test has yet quantified their effects on the current sample.
+A 33-repository candidate set was prepared from the 56 successful report rows:
 
-## Audit inventory preparation
-
-The audit candidate set contains 33 repositories:
-- 21 commit-only disagreements;
-- 2 file-only disagreements;
-- 5 both-true controls (`tool_use=true`, `commit_use=true`);
-- 5 both-false controls (`tool_use=false`, `commit_use=false`).
-
-The both-true control group is not a group in which all three flags are true; `ignored_tools` is mixed in this selection.
-
-Two initial public-source spot checks have been marked `supported`. A systematic audit has not been completed. The automated inventory for all 33 cases is a triage aid and must not be described as 33 manually verified repositories.
-
-The first inventory script used a broad keyword expression over commit messages. That count was noisy because product names and discussion terms can occur without indicating agent authorship. The replacement script removes the general keyword count and instead:
-- reuses the upstream author-pattern expressions against serialized author and co-author fields;
-- separately records pipeline AI labels with no recovered author-pattern match as unresolved;
-- applies the upstream file-pattern regex behavior to the repository file list and changed-file records;
-- keeps `.gitignore` matches and ignored-file metric rows separate;
-- labels all results as automated inventory, not independent confirmation.
-
-The inventory script does not infer that an unmatched AI row definitely came from PR metadata. Such a row is unresolved and requires review of the PR path or other supporting output.
-
-## Current evidence and next work
-
-The existing 56-row report still gives these preliminary results:
-
-| Signal | True |
+| Selection group | Repositories |
 |---|---:|
-| `tool_use` | 19/56 |
-| `commit_use` | 38/56 |
-| `ignored_tools` | 15/56 |
-| File/commit disagreement | 23/56 (21 commit-only; 2 file-only) |
+| Commit-only (`tool_use=false`, `commit_use=true`) | 21 |
+| File-only (`tool_use=true`, `commit_use=false`) | 2 |
+| Both main signals true (controls) | 5 |
+| Both main signals false (controls) | 5 |
+| **Total** | **33** |
 
-Two initial spot checks of commit-only cases found public traces supporting Claude Code use, but this does not establish the accuracy of the heuristic across the remaining candidates or the full sample.
+The five controls in each group were selected using the two main signals, `tool_use` and `commit_use`, with random seed `20261107`. `ignored_tools` was not used to define these control groups, so its values are mixed among the both-true controls.
 
-The next work session should begin with the manual evidence protocol and the 33-candidate table. For each repository, record the exact public artifact (file path, commit SHA, PR URL, or `.gitignore` entry), what it supports, what it does not support, the review decision, and uncertainty. Keep the original pipeline CSVs unchanged.
+Two initial public-source spot checks were recorded:
 
-After manual review, proceed to missed-trace cases and controlled marker-removal experiments on isolated copies or test fixtures. Do not report precision, recall, false-positive rates, or false-negative rates until a defensible reference-label procedure exists.
+- `anthropics/claude-plugins-official`: the inspected commit history included a `Generated with Claude Code` message and a Claude-related co-author attribution.
+- `victorantos/pdfClaw`: several inspected commits included `Co-authored-by: Claude Opus 4.6`.
+
+Both repositories had `tool_use=false`, `commit_use=true`, and `ignored_tools=true`. These spot checks support the presence of Claude Code-related activity in the inspected repositories, but they do not verify every AI-labelled commit. The remaining 31 candidates have not been manually reviewed.
+
+## Evidence inventory helper
+
+The updated `scripts/build_evidence_inventory.py` is an automated triage helper. It reuses the upstream author and file-pattern expressions, records author and co-author matches separately, and keeps file-list matches distinct from `.gitignore` matches.
+
+An AI-labelled commit for which the helper cannot recover a matching author or co-author pattern is recorded as unresolved. The helper does not automatically assume that such a classification came from PR metadata.
+
+The script reads existing local pipeline output and `audit/manual_audit_candidates.csv`; it does not rerun the upstream pipeline. It also requires the repository analysis directories referenced by the report and the pattern files under `config/patterns/`. A fresh clone does not contain all of these local analysis outputs unless they are supplied separately.
+
+The generated `audit/evidence_inventory.csv` and `audit/evidence_notes/` files are triage outputs. They are not manual validation.
+
+## Next steps
+
+1. Complete the manual review of the 33 selected repositories and record exact public URLs, commit SHAs, file paths, decisions, and uncertainty.
+2. Investigate AI-labelled commits without a recovered author or co-author pattern match, including whether PR-derived attribution explains their classification.
+3. For missed-trace candidates, start with repositories where all three pipeline flags are false and look for independent public evidence such as maintainer statements, issue or PR discussions, commit attributions, and tool or author identities absent from the current author patterns.
+4. Run controlled marker-removal and marker-modification tests on isolated repository copies or fixtures.
+5. Update the reported findings only after the manual audit and controlled tests are complete.
