@@ -1,8 +1,22 @@
+# macOS
 .DS_Store
+
+# Python
 __pycache__/
 *.py[cod]
 .venv/
+
+# Environment and credentials
 .env
 tokens.ini
 config/tokens.ini
+
+# Logs
 *.log
+
+# Local pipeline output
+/temp/
+
+# Generated evidence inventory (not manually validated)
+/audit/evidence_inventory.csv
+/audit/evidence_notes/
