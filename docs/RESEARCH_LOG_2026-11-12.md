@@ -1,130 +1,96 @@
-# Research Log — 12 November 2026
+# Research Log Update — November 12, 2026
 
-## Project status
+This note records the additional source-code review, repository-level evidence checks, and audit-helper work completed since the November 7 update. The original `agent-impact` implementation was inspected but not modified. The manual review of the 33-repository sample is still in progress.
 
-This is an independent exploratory follow-up to Robbes et al., *Agentic Much? Adoption of Coding Agents on GitHub* (ACM TOSEM 2026). The initial pipeline run and preliminary RQ1 analysis are complete. RQ2 is in progress; RQ3 has early candidates; RQ4 has not started.
+## Source-code review
 
-## RQ1 baseline retained
+I continued tracing how the upstream pipeline decides which repositories receive commit-level analysis and when it writes the commit-classification files.
 
-The initial run covered 59 repositories selected from the researcher's GitHub starred list. It produced 56 successful main-report rows and 3 failures. Among the 56 successful rows:
+### Commit-adoption gate
 
-- `tool_use=true`: 19
-- `commit_use=true`: 38
-- `ignored_tools=true`: 15
-- all three false: 16
-- file/commit signal disagreement: 23 (21 commit-only and 2 file-only)
+The function `is_commit_adopter()` in `code/heuristics.py` returns `True` when at least one of the following conditions is met: a pull request has a matching AI-related branch name or label; a pull request contains a commit already classified as AI; or the repository commit list contains an AI-classified commit.
 
-The `ratio` field had 38 numeric values, a median of 11.818%, and a range of 0.081%–100%. It is based on AI-classified commits divided by AI- plus Human-classified commits, excluding Bot-classified commits. It is not an AI-generated code percentage.
+The sampled-repository path in `RepoAnalyzer.do_analysis()` calls `run_commit_analysis_internal([])`. Being selected for sampling does not, by itself, guarantee that commit statistics will be written. Inside that function, `compute_adoption_and_metrics()` runs only when the repository has file-based tool matches or `is_commit_adopter()` returns `True`.
 
-These are pipeline outputs, not independently verified use counts. The 59-repository sample is self-selected and does not represent GitHub as a whole.
+At report level, `commit_use` is set to `True` only when the calculated overall commit ratio is present and greater than zero. Therefore, `sampled=True`, `commit_use=False`, and the absence of `commit_stats_main.csv` can occur together. The absence of that CSV must not be interpreted as evidence that the repository has no commit history or that its commits are human-authored.
 
-## RQ2 sample and manual review
+### Raw commit records and classified commit statistics
 
-The manual review sample contains 33 repositories: all 23 discordant repositories, 5 both-main-signals-true controls, and 5 both-main-signals-false controls. Control selection used `tool_use` and `commit_use`, with seed `20261107`; `ignored_tools` did not define the controls.
+The analyzer writes the retrieved commit history to `commit_list.csv`. It writes `commit_stats_main.csv` and `commit_stats_files.csv` later, after commit classification and metric calculation have been triggered. These files have different meanings: `commit_list.csv` contains raw commit records, while `commit_stats_main.csv` contains the upstream pipeline's author-type and tool classifications.
 
-The current candidate CSV contains statuses, but those counts are not final results. Some earlier status changes came from an automated triage pass and must be distinguished from human-verified decisions.
+I also inspected `code/clone_missing_repos.py`. Its fallback for a missing `commit_stats_main.csv` converts records from `commit_list.csv` into `StatSummary` rows with `auth_type="Human"`. This is a convenience step used by that helper script; it is not an independent attribution check. I will not use this fallback output as ground truth or as manually validated evidence in this study.
 
-### Manual evidence review notes
+### Pull-request classification and commit mapping
 
-- `sindresorhus/awesome`: retained as ambiguous. The `codex/` branch name and PR #4146 explain a detector clue, but no explicit disclosure was found in the reviewed material.
-- `hudra0/qosmate`: repository-level Codex activity has supporting evidence from Codex-labelled commits, PR links, and a PR label applied by the ChatGPT Codex Connector. This does not validate every pipeline-labelled commit individually.
-- `3b1b/manim`: repository-level Claude Code activity has supporting traces, including pipeline labels and an external commit-level report with a sampled SHA match. The pipeline's labelled commit count is not assumed to validate every commit.
-- `SagerNet/sing-box`: a raw commit message contains `Co-authored-by: Cursor <cursoragent@cursor.com>`. The evidence inventory's extracted `co_authors` field did not recover that trailer; this is an extraction discrepancy to preserve and investigate.
-- `aiwithremy/claude-skills-llm-council`: a raw commit message contains a Claude co-author trailer. The inventory's extracted co-author field did not recover it; preserve this discrepancy.
-- `openwrt/openwrt`: repository-level Claude Code activity is supported by explicit co-author traces. Some Codex-labelled cases were branch-derived and remain individually unconfirmed.
-- `dmlc/xgboost`: repository-level coding-agent activity has explicit Copilot and Claude attribution examples. Many Codex-labelled commits appear to be branch-derived and should not be treated as individually verified.
-- `anthropics/skills`: multiple commits contain explicit Claude Code co-author or generated-with traces. The repository-level evidence is strong. Separate non-AI-labelled commit traces are RQ3 candidates, not RQ2 validation.
-- `iina/iina`: manual review found direct Codex/Claude-related evidence in selected commit/PR records, including explicit Codex co-author attribution and a PR disclosure. The attempt to save the decision failed because the helper expected `review_note`, while the CSV column is `review_notes`. The CSV therefore did not record that review at the time of this log.
+The inspected `classify_commits_classified_prs()` function first assigns types using commit-level author information, then applies classifications derived from classified pull requests. It uses SHA mappings to transfer PR-derived classifications to main-branch commits when the PR commit SHA is not itself present in the main-branch commit set.
 
-These are working notes from the local terminal review. Exact SHA, PR number, and evidence excerpts still need to be preserved in the manual evidence notes before they are presented as final results.
+The `is_ai_pr_meta()` function checks the PR branch name and labels. `is_commit_adopter()` also checks for AI-classified commits in PRs and in the repository commit list. This confirms that `commit_use` may depend on PR-derived heuristics as well as direct author or co-author patterns. A pipeline classification is still a detector output; it is not independent proof of coding-agent use.
 
-### Batch Audit v1 limitation
+## Source-code observations requiring tests
 
-The local `batch_audit.py` helper applied a broad regular expression to full author identity text:
+The November 7 update recorded three upstream implementation observations that had not been tested. I have continued to keep those observations separate from measured effects. The upstream detection code has not been modified, and I have not measured whether those observations change the 56 successful report rows.
 
-```python
-'Claude': re.compile(r'\bclaude\b|anthropic\.com', re.I)
-```
+A separate review of the local `batch_audit.py` helper identified two risks in its triage logic:
 
-This can match human names such as `Stanislas Daniel Claude Dolcini` or `Jean-Claude Joanna`, and it can treat an employee address at `anthropic.com` as agent attribution. Those are not sufficient evidence of coding-agent use.
+1. Its Claude pattern uses `\bclaude\b|anthropic\.com` and is applied to author identity text. This can match a human name such as `Stanislas Daniel Claude Dolcini` or `Jean-Claude Joanna`, and an `@anthropic.com` address alone does not establish that an identity is an AI agent. The `KenneyNL/Adobe-Alternatives` result was reset to pending after this false-positive risk was identified.
+2. Its PR-number expression accepts both `/pull/123` and a generic `#123` reference. A generic issue reference should not be treated as a verified link to a pull request. A commit-to-PR association should rely on an exact commit SHA or a directly verified PR URL and repository context.
 
-The problem is in the local batch-triage helper, not evidence that the upstream `agent-impact` detector uses the same author matching rule. Batch v1 recommendations are not treated as final manual audit results.
+These are weaknesses in the local batch-triage helper, not demonstrated defects in the upstream `agent-impact` detector. They are being addressed separately.
 
-The helper also attempted to connect PRs using generic `#number` references. Such references can refer to issues as well as PRs, so they do not establish a commit–PR relationship.
+## Evidence-audit preparation
 
-## Upstream pipeline behavior inspected on 12 November
+The 33-repository review sample remains the same sample prepared in the November 7 update:
 
-Source inspection established the following behavior in the saved upstream implementation:
+| Selection group | Repositories |
+|---|---:|
+| Commit-only (`tool_use=false`, `commit_use=true`) | 21 |
+| File-only (`tool_use=true`, `commit_use=false`) | 2 |
+| Both main signals true (controls) | 5 |
+| Both main signals false (controls) | 5 |
+| **Total** | **33** |
 
-- `is_commit_adopter` returns true when a PR has an AI-related branch or label, when a PR contains an AI-classified commit, or when a repository commit is AI-classified.
-- A sampled repository can enter this check even when no file marker was found.
-- `compute_adoption_and_metrics` writes `commit_stats_main.csv` and `commit_stats_files.csv` after the adopter gate is passed.
-- `commit_use` is set true only when an `overall` commit ratio is present and greater than zero.
+The controls were selected using `tool_use` and `commit_use` with random seed `20261107`. `ignored_tools` was not used to define the control groups.
 
-This explains why some repositories can have raw commit or PR records but no `commit_stats_main.csv`. The missing classification file is not evidence that all commits were Human or that the repository had no coding-agent use.
+The current `audit/manual_audit_candidates.csv` records 9 repositories as `supported`, 1 as `ambiguous`, and 23 as pending. These are the current audit-record statuses, not final study-level accuracy estimates. The 33-repository review has not been completed.
 
-### Two both-false controls with unavailable commit statistics
+Additional public-source checks recorded since the previous update include:
 
-The local data inventory identified two examples:
+- `sindresorhus/awesome`: the `codex/` branch name and PR metadata explain why the pipeline raised a commit-related signal, but no explicit public disclosure was found in the reviewed PR. The case remains ambiguous; a branch name alone is not direct confirmation of agent use.
+- `hudra0/qosmate`: three Codex-labelled commits were linked to PRs #60, #61, and #64. The reviewed PR #64 included a `codex` label whose public timeline attributed the label addition to ChatGPT Codex Connector. This supports repository-level Codex activity, but it does not independently validate every labelled commit.
+- `3b1b/manim`: the repository had 67 Claude Code-labelled commits in the local pipeline output. An independent report described 69 Claude Code-assisted commits in a set of 126, and a sample SHA was matched. This supports repository-level activity; it does not validate all 67 pipeline-labelled commits. Some ignored-file metadata in the local output contained invalid future timestamps and `-1` values, which were not treated as evidence.
+- `SagerNet/sing-box`: commit `1beb4cb00234187019d5d64428262ed9e562e26f` contains an explicit `Co-authored-by: Cursor <cursoragent@cursor.com>` trailer. The evidence inventory did not recover the co-author, so the extraction discrepancy is recorded separately from the raw commit evidence.
+- `aiwithremy/claude-skills-llm-council`: a raw commit message contains `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>`. The extracted `co_authors` field was empty, so the raw trailer and parser output remain separate records.
+- `openwrt/openwrt`: the local output contains 29 AI-labelled commits (26 Claude Code and 3 Codex). Multiple Claude co-author trailers were found. The three Codex cases were associated with `codex/` branches but did not have equivalent explicit Codex attribution in the reviewed records; those individual commits remain unconfirmed.
+- `dmlc/xgboost`: the local output contains 144 AI-labelled commits (85 Codex, 47 Copilot, and 12 Claude Code). The review found explicit Copilot attribution examples and one Claude attribution example. Many of the Codex classifications appear to be branch-derived and remain unconfirmed at the individual-commit level.
+- `anthropics/skills`: six AI-labelled commits in the reviewed sample contain explicit Claude co-author trailers. This supports repository-level adoption, but does not validate every AI-labelled commit. The batch helper also identified direct-trace candidates among commits not labelled AI by the pipeline; those are leads for RQ3 and have not yet been independently reviewed as missed traces.
 
-**`georgd/EB-Garamond`**
+I also manually reviewed `iina/iina`. The local report contains 642 commit rows and 15 AI-labelled commits (9 Claude Code, 5 Codex, and 1 Cursor), while the repository-level flags are `tool_use=false` and `commit_use=true`. The review found explicit co-author evidence and a PR disclosure, including a separate Codex trailer in a commit associated with a contributor whose name contains “Jean-Claude.” The human name itself is not evidence; the explicit Codex trailer and PR disclosure are the relevant traces. The attempt to record this review in the CSV failed because the update script expected `review_note`, while the actual column is `review_notes`. The manual decision has therefore not yet been saved to `manual_audit_candidates.csv` and must not be counted as a recorded status change.
 
-- `commit_list.csv` has a header but no data rows.
-- The saved clone has zero commits across available refs since 1 January 2025.
-- Two PR records and two PR commit rows are available.
-- The saved PR rows have no `merged_at` timestamp or `merge_commit_sha`.
-- No commit statistics file was produced.
+## Evidence inventory helper
 
-Interpretation: no eligible repository commit was present in the saved observation window, but the two PR commit records remain part of the review scope. The missing classification is recorded as unavailable, not as Human.
+`scripts/build_evidence_inventory.py` continues to be used to organize the existing local pipeline outputs for manual review. It prepares candidate evidence records; it does not independently validate whether a coding agent was used. Missing extraction results, unmatched co-authors, and absent auxiliary files must remain distinguishable from negative evidence.
 
-**`Fox-Fig/slipstream-rust-plus-deploy`**
+A read-only v2 batch-triage helper was drafted to address the false-positive risks found in v1. Its intended behavior is to inspect `commit_stats_main.csv` when available and retain `commit_list.csv` as raw, unclassified commit data when classification output is absent. It also uses exact SHA-based PR links rather than treating a generic `#123` reference as a PR association, and it does not update the original audit CSV automatically.
 
-- `commit_list.csv` contains 80 raw commit rows.
-- The saved Git references contain 80 commits across refs and 61 commits on `master` since 1 January 2025.
-- The saved PR list and PR-commit file contain zero data rows.
-- `commit_stats_main.csv` and `commit_stats_files.csv` are absent.
-- The upstream log records a 404 response when requesting `.gitignore`.
+The draft helper was checked with synthetic regression cases, including human names containing “Claude,” explicit co-author trailers, generic email-domain matches, and PR references without a verified SHA link. Those synthetic tests passed in the draft environment. The helper has not yet been run against the complete 33-repository sample, so no v2 repository-level counts or revised RQ2 results are reported here.
 
-Interpretation: 80 raw commits are available, but their pipeline classifications are unavailable in the saved stats output. They must not be presumed Human. The missing `.gitignore` response is a data-availability issue, not a negative coding-agent trace.
+## Local output integrity check
 
-## V2 development checkpoint
+I checked the expected evidence files for all 33 selected repositories. The saved local directories contained `files.txt`, `pull_requests/pr_list.csv`, and `pull_requests/pr_commits.csv` for all 33 repositories. `commit_stats_main.csv` and `commit_stats_files.csv` were present for 31 of 33 repositories. The auxiliary `tools/_gitignore` file was present for 27 repositories, and `tools/tool_ignored_files.csv` was present for 10. The absent auxiliary files are not, by themselves, evidence that the corresponding trace was absent from a repository.
 
-The read-only v2 helper has been revised to address the data structures observed in the 33-repository sample:
+The two repositories without the commit-statistics CSVs require different handling:
 
-- it scans `commit_stats_main.csv` when available for pipeline classification;
-- it also scans `commit_list.csv` and `pr_commits.csv` for raw public commit messages;
-- a raw commit without a matching pipeline row receives classification `NOT_AVAILABLE`, not `Human`;
-- PR-body disclosures are counted only when the PR has an exact `pr_commits.csv` SHA link or an exact `merge_commit_sha` match;
-- generic `#123` references are not used as commit–PR links;
-- author and committer identity strings are not used for direct attribution;
-- direct traces on known Human/Bot rows, AI-labelled rows, AI-FOLLOWUP rows, and unclassified rows are reported separately;
-- outputs are written separately from the input CSV and upstream data;
-- each run records input hashes in a manifest and does not make network requests.
+- `georgd/EB-Garamond`: the saved `commit_list.csv` contained only its header, and the local Git query found no commits on the available refs since the analysis start date, 1 January 2025. The separate PR output contained two PRs and two PR-associated commits dated in 2025; the saved PR rows had blank `merged_at` values. These PR records remain available for review, but they should not be confused with main-branch commits in the observation window.
+- `Fox-Fig/slipstream-rust-plus-deploy`: `commit_list.csv` contained 80 raw commit records, all dated on or after 1 January 2025; 61 were reported on `master` since that date. The PR files contained no PR records. The request for a root `.gitignore` returned HTTP 404. The missing classification CSV is therefore not a missing raw-commit history. The 80 raw commits remain unclassified by the saved upstream output and must not be relabelled as Human by the audit helper.
 
-Fourteen synthetic unit/integration tests pass in the current draft. They include regression checks for human names containing `Claude`, exact agent trailers, raw commit records with unavailable classification, exact PR-SHA linkage, and read-only input behavior. This does not replace validation against the 33 real repositories.
+These checks explain why the earlier inventory reported 33 missing expected files: the total included absent auxiliary files as well as the four missing commit-statistics files. It did not mean that 33 repositories were incomplete.
 
-## RQ3 and RQ4
+## Next steps
 
-An initial lead was identified in `anthropics/skills`: direct public traces may exist on commits that the pipeline did not label AI. These require exact SHA-level review. A direct trace on a known Human/Bot-labelled commit is a candidate for RQ3; a trace on a commit with no available pipeline classification remains unclassified and is not a confirmed miss.
-
-RQ4 has not started. The planned work is to use isolated copies or fixtures, remove or modify selected trace markers, and rerun the pipeline to measure output changes.
-
-## Limitations and publication rules
-
-- The sample is small and self-selected, not representative of GitHub.
-- Public traces are imperfect proxies for actual coding-agent use.
-- The current audit is incomplete.
-- No precision, recall, false-positive rate, or false-negative rate is reported without an independently justified ground-truth procedure.
-- Do not generalize sample proportions to GitHub.
-- Keep pipeline classifications, raw public traces, manual decisions, and hypotheses separate.
-- Sentinel values such as future timestamps and `-1` metrics are not interpreted as real activity without source-level confirmation.
-
-## Next actions
-
-1. Run the revised v2 helper on all 33 local candidate repositories.
-2. Inspect every v2 evidence row against the underlying saved commit or PR record.
-3. Correctly record the IINA manual decision using the actual `review_notes` CSV column, after preserving a backup and verifying the exact evidence notes.
-4. Review v2 differences from v1, especially the false-positive cases involving human author names and generic PR references.
-5. Continue RQ2 manual review; do not convert automated recommendations to human statuses.
-6. Review the `anthropics/skills` non-AI-labelled direct traces as RQ3 candidates.
-7. Design RQ4 after the trace types and baseline outputs are documented.
+1. Run the revised read-only v2 helper against the saved outputs for all 33 selected repositories. Check the manifest and per-repository evidence rows before using any summaries.
+2. Correctly record the `iina/iina` manual review using the existing `review_notes` column, while preserving the current CSV and its backups.
+3. Continue the manual review of the pending repositories. Record exact public URLs, commit SHAs, PR numbers, raw evidence, pipeline classifications, decisions, and uncertainty separately.
+4. Review the RQ3 candidates from `anthropics/skills` and other repositories before describing any of them as missed traces.
+5. Keep the upstream source observations and the local batch-helper defects separate. Test any proposed upstream behavior claims with controlled cases before reporting their effects.
+6. Run controlled marker-removal and marker-modification tests on isolated repository copies or fixtures for RQ4.
+7. Update the public README and website article with the existing structure and wording retained. Add only the verified progress from this update; do not replace preliminary RQ1 findings or present the incomplete RQ2 audit as a final result.
